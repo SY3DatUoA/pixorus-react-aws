@@ -3,7 +3,8 @@ frontend:
   phases:
     preBuild:
       commands:
-        - npm install       # ← was: npm ci
+        - npm install
+        - chmod +x node_modules/.bin/react-scripts
     build:
       commands:
         - npm run build
