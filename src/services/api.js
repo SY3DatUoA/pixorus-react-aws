@@ -1,38 +1,21 @@
 // src/services/api.js
-import { fetchAuthSession, getCurrentUser } from "aws-amplify/auth";
+import { getValidToken } from "./auth";
 import awsExports from "../aws-exports";
 
 const API_BASE = awsExports.aws_cloud_logic_custom[0].endpoint;
 
-async function getToken() {
-  try {
-    // First verify user is logged in
-    await getCurrentUser();
-    // Then get the session tokens
-    const session = await fetchAuthSession();
-    const token = session.tokens?.idToken?.toString();
-    if (token) return token;
-
-    // Try accessToken as fallback
-    const access = session.tokens?.accessToken?.toString();
-    if (access) return access;
-
-    throw new Error("No token in session");
-  } catch (e) {
-    console.error("getToken error:", e.message);
-    return null;
-  }
-}
-
 async function request(path, method = "GET", body = null, requireAuth = false) {
   const headers = { "Content-Type": "application/json" };
+
   if (requireAuth) {
-    const token = await getToken();
-    if (!token) throw new Error("Session expired — please log out and log in again");
+    const token = await getValidToken();
+    if (!token) throw new Error("Not authenticated — please log in again");
     headers["Authorization"] = token;
   }
+
   const opts = { method, headers };
   if (body !== null) opts.body = JSON.stringify(body);
+
   const res = await fetch(`${API_BASE}${path}`, opts);
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
