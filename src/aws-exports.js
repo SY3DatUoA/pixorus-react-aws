@@ -1,10 +1,10 @@
+// src/aws-exports.js
 // ─────────────────────────────────────────────────────────────────────────────
-// aws-exports.js  — Generated after running CloudFormation / amplify init
-// Replace ALL placeholder values with your actual AWS output values.
-// These values come from the CloudFormation stack Outputs tab.
+// AWS Configuration — generated from CloudFormation stack outputs
 // ─────────────────────────────────────────────────────────────────────────────
 
 const awsExports = {
+
   // ── Region ──────────────────────────────────────────────────────────────────
   aws_project_region: "us-east-2",
 
@@ -28,10 +28,8 @@ const awsExports = {
   // ── S3 (Product Images) ──────────────────────────────────────────────────────
   aws_user_files_s3_bucket: "pixorus-prodv2-productimagesbucket-77xorxph9lzl",
   aws_user_files_s3_bucket_region: "us-east-2",
+  aws_user_files_s3_bucket_url: "https://pixorus-prodv2-productimagesbucket-77xorxph9lzl.s3.amazonaws.com",
 
-  // ── Auth type for API calls ──────────────────────────────────────────────────
-  // Public endpoints (GET products, GET categories, POST orders) → NONE
-  // Admin endpoints (POST/PUT/DELETE products, categories, GET orders) → AMAZON_COGNITO_USER_POOLS
 };
 
 export default awsExports;
