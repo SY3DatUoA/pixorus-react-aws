@@ -1,6 +1,6 @@
 // src/pages/AdminPage.js
 import { useState, useEffect, useRef } from "react";
-import { signIn, signOut, getCurrentUser } from "aws-amplify/auth";
+import { signInDirect, clearTokens, isAuthenticated } from "../services/auth";
 import { useTheme } from "../context/ThemeContext";
 import {
   getProducts, addProduct, updateProduct, deleteProduct,
@@ -28,14 +28,14 @@ export default function AdminPage({ navigate }) {
   const { toasts, toast } = useToast();
 
   useEffect(() => {
-    getCurrentUser()
-      .then(() => { setAuthed(true); setCheckingAuth(false); })
-      .catch(() => setCheckingAuth(false));
+    // Check if we have a valid stored token
+    setAuthed(isAuthenticated());
+    setCheckingAuth(false);
   }, []);
 
   const handleLogin = () => { setAuthed(true); };
-  const handleLogout = async () => {
-    try { await signOut(); } catch { /* ignore */ }
+  const handleLogout = () => {
+    clearTokens();
     setAuthed(false);
   };
 
@@ -125,7 +125,7 @@ function LoginScreen({ onLogin, navigate }) {
     if (!email || !password) { setError("Please enter email and password."); return; }
     setLoading(true); setError("");
     try {
-      await signIn({ username: email, password });
+      await signInDirect(email, password);
       onLogin();
     } catch (e) {
       setError(e.message || "Login failed. Check your credentials.");
