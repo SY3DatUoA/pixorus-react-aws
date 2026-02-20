@@ -1,15 +1,23 @@
 // src/services/api.js
-import { fetchAuthSession } from "aws-amplify/auth";
+import { fetchAuthSession, getCurrentUser } from "aws-amplify/auth";
 import awsExports from "../aws-exports";
 
 const API_BASE = awsExports.aws_cloud_logic_custom[0].endpoint;
 
 async function getToken() {
   try {
-    const session = await fetchAuthSession({ forceRefresh: false });
+    // First verify user is logged in
+    await getCurrentUser();
+    // Then get the session tokens
+    const session = await fetchAuthSession();
     const token = session.tokens?.idToken?.toString();
-    if (!token) throw new Error("No idToken found");
-    return token;
+    if (token) return token;
+
+    // Try accessToken as fallback
+    const access = session.tokens?.accessToken?.toString();
+    if (access) return access;
+
+    throw new Error("No token in session");
   } catch (e) {
     console.error("getToken error:", e.message);
     return null;
@@ -20,7 +28,7 @@ async function request(path, method = "GET", body = null, requireAuth = false) {
   const headers = { "Content-Type": "application/json" };
   if (requireAuth) {
     const token = await getToken();
-    if (!token) throw new Error("Not authenticated — please log in again");
+    if (!token) throw new Error("Session expired — please log out and log in again");
     headers["Authorization"] = token;
   }
   const opts = { method, headers };
