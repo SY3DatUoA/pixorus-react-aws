@@ -1,0 +1,1401 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Pixorus Store - Full AWS Infrastructure with Cognito Auth, Route53 DNS, and CloudWatch Monitoring'
+
+Parameters:
+  Stage:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment stage
+
+  DomainName:
+    Type: String
+    Default: ''
+    Description: >
+      Your custom domain name (e.g. pixorus.com). Leave blank to skip
+      Route53/custom-domain setup and use the default API Gateway URL.
+
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: >
+      Route53 Hosted Zone ID for DomainName. Required when DomainName is set.
+
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: >
+      ACM Certificate ARN (us-east-1) for DomainName. Required when DomainName is set.
+
+  AdminEmail:
+    Type: String
+    Default: admin@example.com
+    Description: Email address for CloudWatch alarm notifications.
+
+  CognitoAdminEmail:
+    Type: String
+    Default: admin@example.com
+    Description: Email address for the initial Cognito admin user invitation.
+
+Conditions:
+  HasDomain: !And
+    - !Not [!Equals [!Ref DomainName, '']]
+    - !Not [!Equals [!Ref HostedZoneId, '']]
+    - !Not [!Equals [!Ref CertificateArn, '']]
+
+Resources:
+
+  # ===========================
+  # DYNAMODB TABLES
+  # ===========================
+
+  ProductsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'pixorus-products-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: N
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  CategoriesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'pixorus-categories-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: N
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'pixorus-orders-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: N
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  CountersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'pixorus-counters-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: counterName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: counterName
+          KeyType: HASH
+
+  # ===========================
+  # COGNITO USER POOL
+  # ===========================
+
+  # User Pool - stores admin users who can manage the store
+  PixorusUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'pixorus-users-${Stage}'
+      # Require email as username
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      # Password policy
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          TemporaryPasswordValidityDays: 7
+      # MFA off — enable via Cognito console post-deploy if needed
+      MfaConfiguration: "OFF"
+      # User account recovery
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+        InviteMessageTemplate:
+          EmailSubject: 'Your Pixorus Admin Account'
+          EmailMessage: 'Hello {username}, welcome to Pixorus! Your temporary password is {####}. Please sign in and change it.'
+      # Schema - add a "role" attribute to distinguish admin vs staff
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: role
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+
+  # App Client - used by the frontend to authenticate
+  PixorusUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub 'pixorus-web-client-${Stage}'
+      UserPoolId: !Ref PixorusUserPool
+      GenerateSecret: false              # SPA clients must not use a secret
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH           # Secure Remote Password (recommended)
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH      # Fallback for server-side flows
+      # Token validity
+      AccessTokenValidity: 1            # hours
+      IdTokenValidity: 1                # hours
+      RefreshTokenValidity: 30          # days
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      PreventUserExistenceErrors: ENABLED
+      # OAuth settings (enable for hosted-UI login)
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs:
+        - !If
+          - HasDomain
+          - !Sub 'https://${DomainName}/callback'
+          - 'http://localhost:3000/callback'
+      LogoutURLs:
+        - !If
+          - HasDomain
+          - !Sub 'https://${DomainName}'
+          - 'http://localhost:3000'
+
+  # Cognito Domain (hosted UI)
+  PixorusUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub 'pixorus-${Stage}-${AWS::AccountId}'
+      UserPoolId: !Ref PixorusUserPool
+
+  # Identity Pool - enables AWS credentials for frontend (e.g. S3 direct upload)
+  PixorusIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub 'pixorus_identity_${Stage}'
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref PixorusUserPoolClient
+          ProviderName: !GetAtt PixorusUserPool.ProviderName
+
+  # IAM role for authenticated Cognito identities
+  CognitoAuthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'pixorus-cognito-auth-${Stage}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref PixorusIdentityPool
+              ForAnyValue:StringLike:
+                'cognito-identity.amazonaws.com:amr': authenticated
+      Policies:
+        - PolicyName: AuthenticatedAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Allow authenticated users to call the Pixorus API
+              - Effect: Allow
+                Action: execute-api:Invoke
+                Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PixorusApi}/*'
+
+  # Attach authenticated role to Identity Pool
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref PixorusIdentityPool
+      Roles:
+        authenticated: !GetAtt CognitoAuthenticatedRole.Arn
+
+  # Cognito Authorizer for API Gateway
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: !Sub 'pixorus-cognito-authorizer-${Stage}'
+      RestApiId: !Ref PixorusApi
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !GetAtt PixorusUserPool.Arn
+
+  # ===========================
+  # IAM ROLE FOR LAMBDAS
+  # ===========================
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'pixorus-lambda-role-${Stage}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt ProductsTable.Arn
+                  - !GetAtt CategoriesTable.Arn
+                  - !GetAtt OrdersTable.Arn
+                  - !GetAtt CountersTable.Arn
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  # ===========================
+  # LAMBDA FUNCTIONS
+  # ===========================
+
+  GetProductsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'pixorus-getProducts-${Stage}'
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 200, body: '[]' });
+      Environment:
+        Variables:
+          PRODUCTS_TABLE: !Ref ProductsTable
+      Timeout: 10
+
+  AddProductFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'pixorus-addProduct-${Stage}'
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 200, body: '{}' });
+      Environment:
+        Variables:
+          PRODUCTS_TABLE: !Ref ProductsTable
+          COUNTER_TABLE: !Ref CountersTable
+      Timeout: 10
+
+  UpdateProductFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'pixorus-updateProduct-${Stage}'
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 200, body: '{}' });
+      Environment:
+        Variables:
+          PRODUCTS_TABLE: !Ref ProductsTable
+      Timeout: 10
+
+  DeleteProductFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'pixorus-deleteProduct-${Stage}'
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 200, body: '{}' });
+      Environment:
+        Variables:
+          PRODUCTS_TABLE: !Ref ProductsTable
+      Timeout: 10
+
+  GetCategoriesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'pixorus-getCategories-${Stage}'
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 200, body: '[]' });
+      Environment:
+        Variables:
+          CATEGORIES_TABLE: !Ref CategoriesTable
+      Timeout: 10
+
+  ManageCategoryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'pixorus-manageCategory-${Stage}'
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 200, body: '{}' });
+      Environment:
+        Variables:
+          CATEGORIES_TABLE: !Ref CategoriesTable
+          COUNTER_TABLE: !Ref CountersTable
+      Timeout: 10
+
+  PlaceOrderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'pixorus-placeOrder-${Stage}'
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 200, body: '{}' });
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          COUNTER_TABLE: !Ref CountersTable
+      Timeout: 10
+
+  GetOrdersFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'pixorus-getOrders-${Stage}'
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 200, body: '[]' });
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+      Timeout: 10
+
+  # ===========================
+  # API GATEWAY
+  # ===========================
+
+  PixorusApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub 'pixorus-api-${Stage}'
+      Description: Pixorus Store REST API
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  # --- /products ---
+  ProductsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ParentId: !GetAtt PixorusApi.RootResourceId
+      PathPart: products
+
+  ProductsIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ParentId: !Ref ProductsResource
+      PathPart: '{id}'
+
+  # GET /products  — public (no auth required, anyone can browse)
+  GetProductsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResourceId: !Ref ProductsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetProductsFunction.Arn}/invocations'
+
+  # POST /products  — protected (Cognito JWT required)
+  AddProductMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn: CognitoAuthorizer
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResourceId: !Ref ProductsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AddProductFunction.Arn}/invocations'
+
+  # PUT /products/{id}  — protected
+  UpdateProductMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn: CognitoAuthorizer
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResourceId: !Ref ProductsIdResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UpdateProductFunction.Arn}/invocations'
+
+  # DELETE /products/{id}  — protected
+  DeleteProductMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn: CognitoAuthorizer
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResourceId: !Ref ProductsIdResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DeleteProductFunction.Arn}/invocations'
+
+  # --- /categories ---
+  CategoriesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ParentId: !GetAtt PixorusApi.RootResourceId
+      PathPart: categories
+
+  CategoriesIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ParentId: !Ref CategoriesResource
+      PathPart: '{id}'
+
+  # GET /categories  — public
+  GetCategoriesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResourceId: !Ref CategoriesResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetCategoriesFunction.Arn}/invocations'
+
+  # POST /categories  — protected
+  AddCategoryMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn: CognitoAuthorizer
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResourceId: !Ref CategoriesResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ManageCategoryFunction.Arn}/invocations'
+
+  # PUT /categories/{id}  — protected
+  UpdateCategoryMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn: CognitoAuthorizer
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResourceId: !Ref CategoriesIdResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ManageCategoryFunction.Arn}/invocations'
+
+  # DELETE /categories/{id}  — protected
+  DeleteCategoryMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn: CognitoAuthorizer
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResourceId: !Ref CategoriesIdResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ManageCategoryFunction.Arn}/invocations'
+
+  # --- /orders ---
+  OrdersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ParentId: !GetAtt PixorusApi.RootResourceId
+      PathPart: orders
+
+  # GET /orders  — protected (admin only)
+  GetOrdersMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn: CognitoAuthorizer
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResourceId: !Ref OrdersResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetOrdersFunction.Arn}/invocations'
+
+  # POST /orders  — public (customers place orders without signing in)
+  PlaceOrderMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResourceId: !Ref OrdersResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PlaceOrderFunction.Arn}/invocations'
+
+  # --- Deployment ---
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GetProductsMethod
+      - AddProductMethod
+      - UpdateProductMethod
+      - DeleteProductMethod
+      - ProductsOptionsMethod
+      - ProductsIdOptionsMethod
+      - GetCategoriesMethod
+      - AddCategoryMethod
+      - UpdateCategoryMethod
+      - DeleteCategoryMethod
+      - CategoriesOptionsMethod
+      - CategoriesIdOptionsMethod
+      - GetOrdersMethod
+      - PlaceOrderMethod
+      - OrdersOptionsMethod
+      - UploadUrlMethod
+      - UploadUrlOptionsMethod
+    Properties:
+      RestApiId: !Ref PixorusApi
+      StageName: !Ref Stage
+
+  # Enable API Gateway access logging to CloudWatch
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/pixorus-${Stage}'
+      RetentionInDays: 30
+
+  # ===========================
+  # GATEWAY RESPONSES (CORS on error responses)
+  # ===========================
+
+  GatewayResponseDefault4XX:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResponseType: DEFAULT_4XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+
+  GatewayResponseDefault5XX:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResponseType: DEFAULT_5XX
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+
+  GatewayResponseUnauthorized:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResponseType: UNAUTHORIZED
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+
+  GatewayResponseAccessDenied:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResponseType: ACCESS_DENIED
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+
+  # ===========================
+  # S3 BUCKET FOR PRODUCT IMAGES
+  # ===========================
+
+  ProductImagesBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain       # Keep bucket + images if stack is deleted/rolled back
+    UpdateReplacePolicy: Retain
+    # NOTE: No BucketName set — CloudFormation auto-generates a unique name.
+    # This prevents the S3 409 conflict error when re-deploying after a failed attempt.
+    # The actual bucket name is available via the ImagesBucketName stack output.
+    Properties:
+      # Allow public-read so product image URLs work directly in the browser
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT]
+            AllowedOrigins: ['*']
+            MaxAge: 3600
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
+      Tags:
+        - Key: Project
+          Value: Pixorus
+        - Key: Stage
+          Value: !Ref Stage
+
+  ProductImagesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ProductImagesBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${ProductImagesBucket}/*'
+
+  # Grant Lambda permission to generate presigned URLs
+  LambdaS3Policy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub 'pixorus-lambda-s3-${Stage}'
+      Roles: [!Ref LambdaExecutionRole]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:DeleteObject
+            Resource: !Sub 'arn:aws:s3:::${ProductImagesBucket}/*'
+
+  # Lambda that generates a presigned upload URL
+  UploadImageFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'pixorus-uploadImage-${Stage}'
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async () => ({ statusCode: 200, body: '{}' });
+      Environment:
+        Variables:
+          IMAGES_BUCKET: !Ref ProductImagesBucket
+      Timeout: 10
+      Layers: []
+
+  # /upload-url resource on API Gateway
+  UploadUrlResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ParentId: !GetAtt PixorusApi.RootResourceId
+      PathPart: upload-url
+
+  # POST /upload-url — protected (must be logged-in admin)
+  UploadUrlMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn: CognitoAuthorizer
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResourceId: !Ref UploadUrlResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UploadImageFunction.Arn}/invocations'
+
+  # ===========================
+  # OPTIONS METHODS FOR CORS PREFLIGHT
+  # ===========================
+
+  # OPTIONS /products
+  ProductsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResourceId: !Ref ProductsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # OPTIONS /products/{id}
+  ProductsIdOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResourceId: !Ref ProductsIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # OPTIONS /categories
+  CategoriesOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResourceId: !Ref CategoriesResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # OPTIONS /categories/{id}
+  CategoriesIdOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResourceId: !Ref CategoriesIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # OPTIONS /orders
+  OrdersOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResourceId: !Ref OrdersResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # OPTIONS /upload-url (CORS preflight)
+  UploadUrlOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PixorusApi
+      ResourceId: !Ref UploadUrlResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode":200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  UploadImagePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UploadImageFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PixorusApi}/*'
+
+  # ===========================
+  # LAMBDA PERMISSIONS
+  # ===========================
+
+  GetProductsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetProductsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PixorusApi}/*'
+
+  AddProductPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AddProductFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PixorusApi}/*'
+
+  UpdateProductPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UpdateProductFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PixorusApi}/*'
+
+  DeleteProductPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DeleteProductFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PixorusApi}/*'
+
+  GetCategoriesPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetCategoriesFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PixorusApi}/*'
+
+  ManageCategoryPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ManageCategoryFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PixorusApi}/*'
+
+  PlaceOrderPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PlaceOrderFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PixorusApi}/*'
+
+  GetOrdersPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetOrdersFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PixorusApi}/*'
+
+  # ===========================
+  # ROUTE 53 DNS  (only if DomainName is supplied)
+  # ===========================
+
+  # Custom domain name on API Gateway
+  ApiCustomDomain:
+    Type: AWS::ApiGateway::DomainName
+    Condition: HasDomain
+    Properties:
+      DomainName: !Sub 'api.${DomainName}'
+      RegionalCertificateArn: !Ref CertificateArn
+      EndpointConfiguration:
+        Types: [REGIONAL]
+      SecurityPolicy: TLS_1_2
+
+  # Map the custom domain to the stage
+  ApiBasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    Condition: HasDomain
+    DependsOn: ApiDeployment
+    Properties:
+      DomainName: !Ref ApiCustomDomain
+      RestApiId: !Ref PixorusApi
+      Stage: !Ref Stage
+
+  # Route53 A-record (alias) pointing api.yourdomain.com → API Gateway regional endpoint
+  ApiDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub 'api.${DomainName}'
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ApiCustomDomain.RegionalDomainName
+        HostedZoneId: !GetAtt ApiCustomDomain.RegionalHostedZoneId
+        EvaluateTargetHealth: false
+
+  # Route53 health check against the API (GET /products as a canary)
+  ApiHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Condition: HasDomain
+    Properties:
+      HealthCheckConfig:
+        Type: HTTPS
+        FullyQualifiedDomainName: !Sub 'api.${DomainName}'
+        ResourcePath: !Sub '/${Stage}/products'
+        Port: 443
+        RequestInterval: 30
+        FailureThreshold: 3
+      HealthCheckTags:
+        - Key: Name
+          Value: !Sub 'pixorus-api-health-${Stage}'
+
+  # ===========================
+  # CLOUDWATCH MONITORING
+  # ===========================
+
+  # SNS topic — all alarms publish here
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'pixorus-alarms-${Stage}'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AdminEmail
+
+  # ---------- Lambda error alarms ----------
+
+  GetProductsErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'pixorus-getProducts-errors-${Stage}'
+      AlarmDescription: 'Lambda errors on getProducts'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref GetProductsFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmNotificationTopic]
+
+  PlaceOrderErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'pixorus-placeOrder-errors-${Stage}'
+      AlarmDescription: 'Lambda errors on placeOrder'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PlaceOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmNotificationTopic]
+
+  # Alarm when any Lambda throttles — means traffic is spiking
+  LambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'pixorus-lambda-throttles-${Stage}'
+      AlarmDescription: 'Lambda throttling detected'
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PlaceOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmNotificationTopic]
+
+  # ---------- API Gateway alarms ----------
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'pixorus-api-5xx-${Stage}'
+      AlarmDescription: 'API Gateway 5xx errors (server-side failures)'
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub 'pixorus-api-${Stage}'
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmNotificationTopic]
+
+  Api4xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'pixorus-api-4xx-${Stage}'
+      AlarmDescription: 'API Gateway 4xx errors (auth failures / bad requests)'
+      Namespace: AWS/ApiGateway
+      MetricName: 4XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub 'pixorus-api-${Stage}'
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 50
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmNotificationTopic]
+
+  ApiLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'pixorus-api-latency-${Stage}'
+      AlarmDescription: 'API Gateway P99 latency > 3 s'
+      Namespace: AWS/ApiGateway
+      MetricName: Latency
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub 'pixorus-api-${Stage}'
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmNotificationTopic]
+
+  # ---------- Cognito alarms ----------
+
+  # High volume of sign-in failures may indicate a brute-force attack
+  CognitoSignInFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'pixorus-cognito-signinfailures-${Stage}'
+      AlarmDescription: 'Elevated Cognito sign-in failure rate'
+      Namespace: AWS/Cognito
+      MetricName: SignInSuccesses
+      Dimensions:
+        - Name: UserPool
+          Value: !Ref PixorusUserPool
+        - Name: UserPoolClient
+          Value: !Ref PixorusUserPoolClient
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: LessThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmNotificationTopic]
+
+  # ---------- CloudWatch Dashboard ----------
+
+  PixorusDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'Pixorus-${Stage}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0, "y": 0, "width": 24, "height": 1,
+              "properties": { "markdown": "# Pixorus Store — ${Stage} Dashboard" }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 1, "width": 8, "height": 6,
+              "properties": {
+                "title": "API Gateway Requests",
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiName", "pixorus-api-${Stage}", {"stat": "Sum", "period": 60}]
+                ],
+                "view": "timeSeries", "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8, "y": 1, "width": 8, "height": 6,
+              "properties": {
+                "title": "API Errors (4xx / 5xx)",
+                "metrics": [
+                  ["AWS/ApiGateway", "4XXError", "ApiName", "pixorus-api-${Stage}", {"stat": "Sum", "period": 60, "color": "#ff7f0e"}],
+                  ["AWS/ApiGateway", "5XXError", "ApiName", "pixorus-api-${Stage}", {"stat": "Sum", "period": 60, "color": "#d62728"}]
+                ],
+                "view": "timeSeries", "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16, "y": 1, "width": 8, "height": 6,
+              "properties": {
+                "title": "API Latency p99",
+                "metrics": [
+                  ["AWS/ApiGateway", "Latency", "ApiName", "pixorus-api-${Stage}", {"stat": "p99", "period": 60}]
+                ],
+                "view": "timeSeries", "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 7, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda Errors",
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "pixorus-getProducts-${Stage}", {"stat": "Sum", "period": 60}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "pixorus-addProduct-${Stage}", {"stat": "Sum", "period": 60}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "pixorus-placeOrder-${Stage}", {"stat": "Sum", "period": 60}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "pixorus-getOrders-${Stage}", {"stat": "Sum", "period": 60}]
+                ],
+                "view": "timeSeries", "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 7, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda Duration (avg ms)",
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "pixorus-getProducts-${Stage}", {"stat": "Average", "period": 60}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "pixorus-placeOrder-${Stage}", {"stat": "Average", "period": 60}]
+                ],
+                "view": "timeSeries", "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 13, "width": 12, "height": 6,
+              "properties": {
+                "title": "Cognito Sign-Ins",
+                "metrics": [
+                  ["AWS/Cognito", "SignInSuccesses", "UserPool", "${PixorusUserPool}", "UserPoolClient", "${PixorusUserPoolClient}", {"stat": "Sum", "period": 300}]
+                ],
+                "view": "timeSeries", "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "alarm",
+              "x": 12, "y": 13, "width": 12, "height": 6,
+              "properties": {
+                "title": "Alarm Status",
+                "alarms": [
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:pixorus-api-5xx-${Stage}",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:pixorus-api-4xx-${Stage}",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:pixorus-api-latency-${Stage}",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:pixorus-getProducts-errors-${Stage}",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:pixorus-placeOrder-errors-${Stage}",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:pixorus-lambda-throttles-${Stage}"
+                ]
+              }
+            }
+          ]
+        }
+
+# ===========================
+# OUTPUTS
+# ===========================
+
+Outputs:
+
+  # --- API ---
+  ApiUrl:
+    Description: "API Gateway base URL (default)"
+    Value: !Sub 'https://${PixorusApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}'
+    Export:
+      Name: !Sub 'PixorusApiUrl-${Stage}'
+
+  CustomApiUrl:
+    Condition: HasDomain
+    Description: "API Gateway custom domain URL"
+    Value: !Sub 'https://api.${DomainName}'
+    Export:
+      Name: !Sub 'PixorusCustomApiUrl-${Stage}'
+
+  # --- Cognito ---
+  UserPoolId:
+    Description: "Cognito User Pool ID — needed for frontend Amplify config"
+    Value: !Ref PixorusUserPool
+    Export:
+      Name: !Sub 'PixorusUserPoolId-${Stage}'
+
+  UserPoolClientId:
+    Description: "Cognito App Client ID"
+    Value: !Ref PixorusUserPoolClient
+    Export:
+      Name: !Sub 'PixorusUserPoolClientId-${Stage}'
+
+  IdentityPoolId:
+    Description: "Cognito Identity Pool ID"
+    Value: !Ref PixorusIdentityPool
+    Export:
+      Name: !Sub 'PixorusIdentityPoolId-${Stage}'
+
+  CognitoHostedUiUrl:
+    Description: "Cognito Hosted UI login URL"
+    Value: !Sub >-
+      https://pixorus-${Stage}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/login
+        ?client_id=${PixorusUserPoolClient}
+        &response_type=code
+        &scope=openid+email+profile
+        &redirect_uri=https://api.${DomainName}/callback
+
+  # --- Tables ---
+  ProductsTableName:
+    Value: !Ref ProductsTable
+
+  CategoriesTableName:
+    Value: !Ref CategoriesTable
+
+  OrdersTableName:
+    Value: !Ref OrdersTable
+
+  # --- Monitoring ---
+  DashboardUrl:
+    Description: "CloudWatch Dashboard URL"
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=Pixorus-${Stage}'
+
+  AlarmTopicArn:
+    Description: "SNS Alarm Topic ARN"
+    Value: !Ref AlarmNotificationTopic
+
+  # --- S3 Images ---
+  ImagesBucketName:
+    Description: "S3 bucket name for product images"
+    Value: !Ref ProductImagesBucket
+    Export:
+      Name: !Sub 'PixorusImagesBucket-${Stage}'
+
+  ImagesBucketUrl:
+    Description: "Public base URL for product images"
+    Value: !Sub 'https://${ProductImagesBucket}.s3.amazonaws.com'
