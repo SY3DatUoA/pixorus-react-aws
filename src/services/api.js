@@ -1,4 +1,4 @@
-// src/services/api.js
+
 import { fetchAuthSession } from "aws-amplify/auth";
 import awsExports from "../aws-exports";
 
