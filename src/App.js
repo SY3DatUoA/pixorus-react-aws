@@ -1,22 +1,11 @@
-// src/App.js
+// src/App.js — No Amplify dependency, uses direct Cognito auth
 import { useState, useEffect } from "react";
-import { Amplify } from "aws-amplify";
 import { ThemeProvider } from "./context/ThemeContext";
 import { CartProvider } from "./context/CartContext";
 import LandingPage from "./pages/LandingPage";
 import StorePage from "./pages/StorePage";
 import AdminPage from "./pages/AdminPage";
 import "./index.css";
-
-Amplify.configure({
-  Auth: {
-    Cognito: {
-      userPoolId: "us-east-2_qXO8kHFOj",
-      userPoolClientId: "47edciociemavkgvunh74u1pp8",
-      loginWith: { email: true },
-    },
-  },
-});
 
 function getRoute() {
   const hash = window.location.hash;
