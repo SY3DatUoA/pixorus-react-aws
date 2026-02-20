@@ -8,23 +8,12 @@ import StorePage from "./pages/StorePage";
 import AdminPage from "./pages/AdminPage";
 import "./index.css";
 
-// Amplify v6 configuration — uses explicit config object instead of aws-exports
 Amplify.configure({
   Auth: {
     Cognito: {
       userPoolId: "us-east-2_qXO8kHFOj",
       userPoolClientId: "47edciociemavkgvunh74u1pp8",
-      loginWith: {
-        email: true,
-      },
-    },
-  },
-  API: {
-    REST: {
-      PixorusAPI: {
-        endpoint: "https://t19fbnere7.execute-api.us-east-2.amazonaws.com/prod",
-        region: "us-east-2",
-      },
+      loginWith: { email: true },
     },
   },
 });
