@@ -1,7 +1,6 @@
 // src/aws-exports.js
 // ─────────────────────────────────────────────────────────────────────────────
 // AWS Configuration — generated from CloudFormation stack outputs
-// ─────────────────────────────────────────────────────────────────────────────
 
 const awsExports = {
 
